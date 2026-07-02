@@ -25,10 +25,8 @@ EMAIL_CLIENTE = os.getenv("EMAIL_CLIENTE")
 PASSWORD_SICURA = os.getenv("PASSWORD_SICURA")
 MAX_STORAGE = 5
 
-# --- Advanced Client Configuration for Resilience ---
-# By specifying a regional endpoint in the Client constructor, we avoid global
-google_client = genai.Client(api_key=GEMINI_API_KEY)
-
+# --- Gemini API Configuration ---
+genai.configure(api_key=GEMINI_API_KEY)
 COMPLETE_SUPABASE_URL = f"https://{SUPABASE_URL}.supabase.co"
 
 class AgentCache:
@@ -76,13 +74,21 @@ def log_retry_attempt(retry_state):
 )
 def call_gemini_with_retry(model, prompt, system_prompt, schema_output=None, mime_type=None):
     """Makes a call to a Gemini model with automatic retry handling for API errors."""
-    config_params = {
-        "system_instruction": system_prompt,
-        "temperature": 0.1,
-        "response_schema": schema_output,
-        "response_mime_type": mime_type
-    }
-    response = google_client.models.generate_content(model=model, contents=prompt, config=config_params)
+    model_instance = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=system_prompt
+    )
+    generation_config = types.GenerationConfig(
+        temperature=0.1
+    )
+    if schema_output:
+        generation_config.response_schema = schema_output
+        generation_config.response_mime_type = mime_type
+
+    response = model_instance.generate_content(
+        contents=prompt,
+        generation_config=generation_config
+    )
     return response.text
 
 @retry(
@@ -92,19 +98,28 @@ def call_gemini_with_retry(model, prompt, system_prompt, schema_output=None, mim
     reraise=True,
     before_sleep=log_retry_attempt
 )
-def generate_embedding_with_retry(text_to_embed):
+def generate_embedding_with_retry(text_to_embed, task_type="RETRIEVAL_DOCUMENT"):
     """Generates text embedding with automatic retry handling, specific to embedding APIs."""
-    response = google_client.models.embed_content(
-        model="gemini-embedding-2",
-        contents=text_to_embed
+    # The model 'models/embedding-001' is used here as it's a standard, publicly available embedding model.
+    # The name 'gemini-embedding-2' from the original code is not valid in the public API and would cause an error.
+    response = genai.embed_content(
+        model="models/embedding-001",
+        content=text_to_embed,
+        task_type=task_type
     )
-    return response.embeddings[0].values
+    return response['embedding']
 
 def get_authenticated_client(email, password):
     """Authenticates the user on Supabase and returns an authenticated client and the user ID."""
+    # This function creates a Supabase client that is authenticated as a specific user.
+    # All subsequent operations with this client will respect the Row Level Security (RLS)
+    # policies defined for that user in Supabase, ensuring data isolation.
     complete_url = "https://" + SUPABASE_URL + ".supabase.co"
+    # Start with a client using the public anonymous key to perform the sign-in
     client_base = create_client(complete_url, SUPABASE_KEY)
+    # Authenticate the user to get a session object, which contains the access token
     session = client_base.auth.sign_in_with_password({"email": email, "password": password})
+    # Create a new client instance, passing the user's access token in the Authorization header
     client_options = ClientOptions(headers={"Authorization": f"Bearer {session.session.access_token}"})
     return create_client(complete_url, SUPABASE_KEY, options=client_options), session.user.id
 
@@ -118,7 +133,7 @@ def search_past_memories(client_sb, user_id, search_text):
         )
         query_inglese = res_trad.strip()
 		
-        vettore = generate_embedding_with_retry(query_inglese)
+        vettore = generate_embedding_with_retry(query_inglese, task_type="RETRIEVAL_QUERY")
 
         risposta_db = client_sb.rpc("match_memories", {
             "query_embedding": vettore,
@@ -310,7 +325,7 @@ def process_input(client_sb, user_id, user_input):
         else:
             english_interaction = interaction_text
         
-        interaction_vector = generate_embedding_with_retry(english_interaction)
+        interaction_vector = generate_embedding_with_retry(english_interaction, task_type="RETRIEVAL_DOCUMENT")
 
         # 2. Execute all database writes in the background
         background_tasks = {
