@@ -1,37 +1,39 @@
-# Personal Copilot Project
+# Personal Memory Bot
 
 This project is a Python-based conversational AI agent that demonstrates long-term memory capabilities. It uses Google's Gemini models for its core intelligence and Supabase as a backend for data persistence, including a vector database for semantic memory retrieval (RAG).
 
 ## Features
 
-*   **Conversational Loop**: An interactive command-line interface to chat with the agent.
+*   **Telegram Bot Interface**: Interact with the agent directly through Telegram.
 *   **Long-Term Memory (RAG)**: The agent can remember past conversations by storing summaries in a vector database and retrieving relevant information semantically.
 *   **User Profile Management**: The agent can learn and recall user preferences (e.g., name, favorite color) and stores them in a structured profile.
-*   **Structured Data Extraction**: Uses Pydantic and Gemini's function calling to reliably extract information from user input and manage memory.
+*   **Structured Dual Output**: Uses Pydantic and a single Gemini call to generate a user response and extract database actions simultaneously, improving performance and reducing API calls.
 *   **API Resilience**: Automatically retries API calls to Gemini using an exponential backoff strategy to handle temporary service unavailability.
 *   **Secure Credential Management**: Keeps API keys and credentials separate from the source code using a `.env` file.
+*   **Asynchronous & Performant**: Built with `asyncio` and `python-telegram-bot`, with database operations running in background threads to ensure the bot remains responsive.
 
 ## Tech Stack
 
 *   **Language**: Python 3
-*   **AI Model**: Google Gemini (`gemini-2.5-flash-lite`, `gemini-2.5-flash`, `gemini-embedding-2`)
-*   **Database**: Supabase (PostgreSQL with `pgvector` extension)
+*   **AI Model**: Google Gemini (`gemini-3.5-flash`, `gemini-3.1-flash-lite`, `gemini-embedding-2`)
+*   **Database**: Supabase (PostgreSQL with `pgvector` extension for RAG)
 *   **Key Python Libraries**:
     *   `google-generativeai`
+    *   `python-telegram-bot`
     *   `supabase`
     *   `pydantic`
     *   `tenacity`
     *   `python-dotenv`
 
-## Setup
+## 🚀 Getting Started
 
 Follow these steps to get the project running.
 
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repository-url>
-cd <repository-folder>
+git clone https://github.com/your-username/your-repo-name.git
+cd your-repo-name
 ```
 
 ### 2. Install Dependencies
@@ -39,38 +41,12 @@ cd <repository-folder>
 Install the required Python packages using pip:
 
 ```bash
-pip install google-generativeai supabase pydantic tenacity python-dotenv
+pip install google-generativeai python-telegram-bot supabase pydantic tenacity python-dotenv
 ```
 
 ### 3. Set up Supabase
 
-1.  Create a new project on Supabase.
-2.  Go to the **SQL Editor** and run the following queries to set up the database:
-
-    ```sql
-    -- 1. Enable the vector extension
-    create extension if not exists vector;
-
-    -- 2. Create the table for user profile data
-    create table user_profile (
-      user_id uuid not null,
-      key_name text not null,
-      value_data text,
-      context_desc text,
-      is_sensitive boolean default true,
-      created_at timestamptz default now(),
-      primary key (user_id, key_name)
-    );
-
-    -- 3. Create the table for long-term vector memory
-    create table agent_memories (
-      id bigserial primary key,
-      user_id uuid not null,
-      memory_text text,
-      memory_vector vector(768), -- Corresponds to gemini-embedding-2
-      created_at timestamptz default now()
-    );
-    ```
+This project uses two distinct database schemas: one for the command-line test script (`test_memoria.py`) and one for the Telegram Bot (`Bot_Telegram.py`).
 
 ### 4. Configure Environment Variables
 
@@ -83,14 +59,65 @@ pip install google-generativeai supabase pydantic tenacity python-dotenv
     GEMINI_API_KEY="<your-gemini-api-key>"
     EMAIL_CLIENTE="<your-supabase-auth-email>"
     PASSWORD_SICURA="<your-supabase-auth-password>"
+    TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
+    SUPABASE_SERVICE_KEY="<your-supabase-service-role-key>"
     ```
 
-## Usage
+## 5. Usage
 
-Once the setup is complete, you can run the agent from your terminal:
+### Running the Telegram Bot
 
-```bash
-python test_memoria.py
-```
+1.  **Database Setup**: Go to the **SQL Editor** in your Supabase project and run the following script. This will create the tables and functions required by the Telegram bot.
 
-The script will start an interactive session where you can chat with the agent. Type `exit` to end the session.
+    ```sql
+    -- 1. Enable the vector extension if not already enabled
+    create extension if not exists vector;
+
+    -- 2. Create the table for Telegram user profile data
+    create table telegram_user_profile (
+      user_id bigint not null, -- Telegram uses integer IDs
+      key_name text not null,
+      value_data text,
+      context_desc text,
+      is_sensitive boolean default true,
+      created_at timestamptz default now(),
+      primary key (user_id, key_name)
+    );
+
+    -- 3. Create the table for Telegram long-term vector memory
+    create table telegram_agent_memories (
+      id bigserial primary key,
+      user_id bigint not null, -- Telegram uses integer IDs
+      memory_text text,
+      memory_vector vector(3072), -- Use 3072 for 'gemini-embedding-2'
+      created_at timestamptz default now()
+    );
+
+    -- 4. Create the RPC function for semantic search
+    create or replace function match_telegram_memories (
+      query_embedding vector(3072),
+      match_threshold float,
+      match_count int,
+      p_user_id bigint
+    )
+    returns table (
+      id bigint,
+      memory_text text,
+      similarity float
+    )
+    language sql stable
+    as $$
+      select
+        tam.id,
+        tam.memory_text,
+        1 - (tam.memory_vector <=> query_embedding) as similarity
+      from telegram_agent_memories tam
+      where tam.user_id = p_user_id and 1 - (tam.memory_vector <=> query_embedding) > match_threshold
+      order by similarity desc
+      limit match_count;
+    $$;
+    ```
+2.  **Run the Bot**:
+    ```bash
+    python Bot_Telegram.py
+    ```

@@ -1,38 +1,46 @@
 """
-Test script for a personal AI assistant with long-term memory.
+Telegram Bot for a personal AI assistant with long-term memory.
 
-This script implements a conversational agent that uses Supabase for data persistence
-(user profile and vector memory) and Google Gemini APIs for generative and embedding
-capabilities. It includes caching mechanisms, API call retries, and an architecture
-for structured memory management.
+This script runs a Telegram bot that uses Supabase for data persistence (user
+profile and vector memory) and Google Gemini APIs for its generative and
+embedding capabilities. It features an asynchronous architecture, caching, API
+call retries, and background processing for database operations.
 """
 import os
-from typing import List, Literal
 import asyncio
+import logging
+import concurrent.futures
+from dotenv import load_dotenv
+from typing import List, Literal
+
 from google import genai
-from google.genai import errors, types
+from google.genai import errors as genai_errors
+from google.genai import types
+
 from pydantic import BaseModel, Field
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client, ClientOptions
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-import concurrent.futures
-from dotenv import load_dotenv
+
 
 # --- Configuration and Constants ---
 load_dotenv(dotenv_path='accessdata.env') # Load environment variables from the specified file
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-EMAIL_CLIENTE = os.getenv("EMAIL_CLIENTE")
-PASSWORD_SICURA = os.getenv("PASSWORD_SICURA")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # Use the service role key for admin access
 MAX_STORAGE = 5
 
-# --- Advanced Client Configuration for Resilience ---
-# By specifying a regional endpoint in the Client constructor, we avoid global
-google_client = genai.Client(api_key=GEMINI_API_KEY)
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set the logging level for httpx to WARNING to reduce polling noise
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# --- Gemini API Configuration ---
+google_client = genai.Client(api_key=GEMINI_API_KEY)
 COMPLETE_SUPABASE_URL = f"https://{SUPABASE_URL}.supabase.co"
 
 class AgentCache:
@@ -65,80 +73,115 @@ class GeminiDualOutput(BaseModel):
 
 def log_retry_attempt(retry_state):
     """Log the retry attempt number and the exception that caused it."""
-    print(
-        f"⚠️ Retrying API call... "
-        f"Attempt #{retry_state.attempt_number}, "
-        f"Exception: {retry_state.outcome.exception()}"
+    logging.warning(
+        "Retrying API call... Attempt #%d, Exception: %s",
+        retry_state.attempt_number, retry_state.outcome.exception()
     )
 
+from typing import Union, List, Any
+
 @retry(
-    retry=retry_if_exception_type((errors.APIError, errors.ServerError, errors.ClientError)),
+    retry=retry_if_exception_type((genai_errors.ServerError, genai_errors.APIError)),
     wait=wait_exponential(multiplier=2, min=2, max=20), 
     stop=stop_after_attempt(3),
     reraise=True,
     before_sleep=log_retry_attempt
 )
-def call_gemini_with_retry(model, prompt, system_prompt, schema_output=None, mime_type=None):
-    """Makes a call to a Gemini model with automatic retry handling for API errors."""
-    config_params = {
-        "system_instruction": system_prompt,
-        "temperature": 0.1,
-        "response_schema": schema_output,
-        "response_mime_type": mime_type
-    }
-    response = google_client.models.generate_content(model=model, contents=prompt, config=config_params)
+async def call_gemini_with_retry(
+    model: str, 
+    contents: Union[str, List[Any]], 
+    system_prompt: str, 
+    schema_output=None, 
+    mime_type=None, 
+    websearch: bool = False, 
+    temperature: float = 0.1 # UPDATE: Dynamic parameter with a default value of 0.1
+):
+    """Asynchronously calls a Gemini model supporting text/multimodal inputs, dynamic temperature, and retries."""
+    
+    active_tools = []
+    if websearch:
+        active_tools.append(types.Tool(google_search=types.GoogleSearch()))
+
+    # Configuration with dynamic temperature passed to the call
+    generation_config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        temperature=temperature, # Apply the temperature passed as an argument
+        tools=active_tools if active_tools else None
+    )
+    
+    if schema_output:
+        generation_config.response_schema = schema_output
+        generation_config.response_mime_type = "application/json"
+    elif mime_type:
+        generation_config.response_mime_type = mime_type
+
+
+    response = await google_client.aio.models.generate_content(
+        model=model,
+        contents=contents, 
+        config=generation_config
+    )
+    
+    if schema_output and mime_type == "application/json":
+        return response.parsed
+        
     return response.text
 
+
 @retry(
-    retry=retry_if_exception_type((errors.APIError, errors.ServerError, errors.ClientError)),
+    retry=retry_if_exception_type((genai_errors.ServerError, genai_errors.APIError)),
     wait=wait_exponential(multiplier=2, min=2, max=20), 
     stop=stop_after_attempt(3),
     reraise=True,
     before_sleep=log_retry_attempt
 )
-def generate_embedding_with_retry(text_to_embed):
-    """Generates text embedding with automatic retry handling, specific to embedding APIs."""
-    response = google_client.models.embed_content(
-        model="gemini-embedding-2",
-        contents=text_to_embed
+async def generate_embedding_with_retry(text_to_embed: str, task_type="RETRIEVAL_DOCUMENT"):
+    """Generates native 3072-dimension vectors for Supabase."""
+    
+    response = await google_client.aio.models.embed_content(
+        model="gemini-embedding-2",  # This model automatically generates 3072-dimension embeddings
+        contents=text_to_embed, 
+        config=types.EmbedContentConfig(
+            task_type=task_type
+        )
     )
-    return response.embeddings[0].values
+    return response.embeddings[0].values if response.embeddings else []
 
-def get_authenticated_client(email, password):
-    """Authenticates the user on Supabase and returns an authenticated client and the user ID."""
-    complete_url = "https://" + SUPABASE_URL + ".supabase.co"
-    client_base = create_client(complete_url, SUPABASE_KEY)
-    session = client_base.auth.sign_in_with_password({"email": email, "password": password})
-    client_options = ClientOptions(headers={"Authorization": f"Bearer {session.session.access_token}"})
-    return create_client(complete_url, SUPABASE_KEY, options=client_options), session.user.id
 
-def search_past_memories(client_sb, user_id, search_text):
-    """Performs a semantic search (RAG) in the user's long-term memory on Supabase."""
+async def search_past_memories(client_sb, user_id, search_text):
+    """Asynchronously performs a semantic search (RAG) in the user's long-term memory."""
     try:
-        res_trad = call_gemini_with_retry(
-            model='gemini-3.5-flash', # STRATEGY: Use the main, more stable model to avoid congestion on 'lite' versions.
-            prompt=f"Translate this search query into a concise English keywords sentence: '{search_text}'",
-            system_prompt="Translate the user's search intent into a concise English keyword-based sentence."
+        # UPDATE: Using 'contents' parameter and implicit temperature of 0.1
+        res_trad = await call_gemini_with_retry(
+            model='gemini-3.1-flash-lite', 
+            contents=f"Rephrase this search query for a vector database: '{search_text}'",
+            system_prompt="Your task is to rephrase the user's search query into a concise, keyword-focused English sentence, optimized for semantic vector search."
         )
         query_inglese = res_trad.strip()
 		
-        vettore = generate_embedding_with_retry(query_inglese)
+        vettore = await generate_embedding_with_retry(query_inglese, task_type="RETRIEVAL_QUERY")
 
-        risposta_db = client_sb.rpc("match_memories", {
-            "query_embedding": vettore,
-            "match_threshold": 0.4,
-            "match_count": 3,
-            "p_user_id": user_id
-        }).execute()
+        # Run the synchronous DB call in a separate thread
+        loop = asyncio.get_running_loop()
+        risposta_db = await loop.run_in_executor(
+            None,
+            lambda: client_sb.rpc("match_telegram_memories", {
+                "query_embedding": vettore,
+                "match_threshold": 0.4,
+                "match_count": 3,
+                "p_user_id": user_id
+            }).execute()
+        )
+
         return [riga['memory_text'] for riga in risposta_db.data]
     except Exception as e:
-        print(f"⚠️ Vector search error: {e}")
+        logging.error("Vector search error: %s", e)
         return []
 
 def _get_chat_history(client_sb, user_id):
     """Fetches the recent chat history from Supabase."""
     try:
-        response = client_sb.table("agent_memories").select("memory_text").eq("user_id", user_id).order("created_at", ascending=False).limit(MAX_STORAGE).execute()
+        response = client_sb.table("telegram_agent_memories").select("memory_text").eq("user_id", user_id).order("created_at", ascending=False).limit(MAX_STORAGE).execute()
         history = [row['memory_text'] for row in response.data]
         history.reverse()
         return history
@@ -150,7 +193,7 @@ def _get_user_profile(client_sb, user_id):
     profile = AgentCache.get_profile(user_id)
     if profile is None:
         try:
-            response = client_sb.table("user_profile").select("key_name", "value_data", "context_desc", "is_sensitive").execute()
+            response = client_sb.table("telegram_user_profile").select("key_name", "value_data", "context_desc", "is_sensitive").execute()
             profile = response.data
             AgentCache.set_profile(user_id, profile)
         except Exception:
@@ -162,41 +205,44 @@ def _execute_background_tasks(client_sb, user_id, tasks):
     with concurrent.futures.ThreadPoolExecutor() as executor:
         # Task 1: Delete chat memories if requested
         if tasks.get("delete_chat_memories"):
-            print("🔂 [BACKGROUND-DB] Submitting task: Delete all vector memories...")
-            executor.submit(client_sb.table("agent_memories").delete().eq("user_id", user_id).execute)
+            logging.info("Submitting background task: Delete all vector memories...")
+            executor.submit(client_sb.table("telegram_agent_memories").delete().eq("user_id", user_id).execute)
 
         # Task 2: Delete profile keys if requested
         if tasks.get("profile_keys_to_delete"):
             keys = list(set(tasks["profile_keys_to_delete"]))
-            print(f"🔂 [BACKGROUND-DB] Submitting task: Delete {len(keys)} profile keys...")
-            executor.submit(client_sb.table("user_profile").delete().eq("user_id", user_id).in_("key_name", keys).execute)
+            logging.info("Submitting background task: Delete %d profile keys...", len(keys))
+            executor.submit(client_sb.table("telegram_user_profile").delete().eq("user_id", user_id).in_("key_name", keys).execute)
 
         # Task 3: Upsert profile keys if requested
         if tasks.get("profile_records_to_upsert"):
             records = tasks["profile_records_to_upsert"]
-            print(f"🔂 [BACKGROUND-DB] Submitting task: Upsert {len(records)} profile records...")
-            executor.submit(client_sb.table("user_profile").upsert(records, on_conflict="user_id,key_name").execute)
+            logging.info("Submitting background task: Upsert %d profile records...", len(records))
+            executor.submit(client_sb.table("telegram_user_profile").upsert(records, on_conflict="user_id,key_name").execute)
 
         # Task 4: Save the current conversation to long-term memory
         if tasks.get("current_interaction_embedding"):
             embedding_data = tasks["current_interaction_embedding"]
-            print("🔂 [BACKGROUND-DB] Submitting task: Save current interaction to memory...")
-            executor.submit(client_sb.table("agent_memories").insert(embedding_data).execute)
+            logging.info("Submitting background task: Save current interaction to memory...")
+            executor.submit(client_sb.table("telegram_agent_memories").insert(embedding_data).execute)
 
-    AgentCache.invalidate(user_id)
+    AgentCache.invalidate(user_id) # Invalidate cache after writes are done
 
-def process_input(client_sb, user_id, user_input):
-    """Orchestrates the entire response process: retrieves context, updates memory, and generates a response."""
-    action_list_summary = " no specific database operations were performed in this turn." # Safety initialization
+async def process_input(client_sb, user_id, user_input):
+    """
+    Asynchronously orchestrates the entire response process: retrieves context,
+    updates memory, and generates a response.
+    """
+    # --- Parallel Asynchronous Context Fetching ---
+    # Run synchronous DB/file operations in threads to avoid blocking
+    history_task = asyncio.to_thread(_get_chat_history, client_sb, user_id)
+    profile_task = asyncio.to_thread(_get_user_profile, client_sb, user_id)
+    # Run async RAG search directly
+    memories_task = search_past_memories(client_sb, user_id, user_input)
 
-    # --- Parallel Context Fetching ---
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_history = executor.submit(_get_chat_history, client_sb, user_id)
-        future_profile = executor.submit(_get_user_profile, client_sb, user_id)
-        future_memories = executor.submit(search_past_memories, client_sb, user_id, user_input)
-        chat_history = future_history.result()
-        current_profile = future_profile.result()
-        relevant_memories = future_memories.result()
+    chat_history, current_profile, relevant_memories = await asyncio.gather(
+        history_task, profile_task, memories_task
+    )
 
     try:
         # Lists to accumulate records for bulk operations.
@@ -211,16 +257,16 @@ def process_input(client_sb, user_id, user_input):
                 # Case 1: Handle deletion requests.
                 if preference_item.action_type == "delete":
                     if preference_item.memory_target in ["chat_memories", "all"] and not delete_chat_memory:
-                        print(f"🗑️ [GDPR PURGE] Deletion request detected for semantic chat memories.")
+                        logging.info("GDPR PURGE: Deletion request detected for semantic chat memories.")
                         delete_chat_memory = True
                     if preference_item.memory_target in ["profile", "all"]:
                         if preference_item.memory_target == "all":
-                            print("🗑️ [GDPR PURGE] Profile reset scheduled (system keys excluded).")
+                            logging.info("GDPR PURGE: Profile reset scheduled (system keys excluded).")
                             keys_to_delete.extend([r['key_name'] for r in current_profile if r.get('is_sensitive', False)])
                         else:
                             old_record = next((row for row in current_profile if row['key_name'] == preference_item.key_name), None)
                             if old_record and not old_record.get('is_sensitive', False):
-                                print(f"🛡️ [SECURITY] Deletion denied for system key: '{preference_item.key_name}'")
+                                logging.warning("SECURITY: Deletion denied for system key: '%s'", preference_item.key_name)
                             else:
                                 keys_to_delete.append(preference_item.key_name)
                 # Case 2: Handle save/update requests.
@@ -249,8 +295,7 @@ def process_input(client_sb, user_id, user_input):
         **RESPONSE GENERATION RULES:**
         - You MUST reply strictly in the language with this ISO 639-1 code: {language_setting}.
         - Your response should be natural, conversational, and based on all the context provided.
-        - You are working on behalf of the Personal Copilot Project.
-        - If the data extraction operation finds someting to update on the user profile (upsert or delete), inform the user on what your're planning to do without technical words if possibile
+        - If the data extraction finds something to update on the user profile (an upsert or delete), inform the user about what you are planning to do, using simple, non-technical language.
 
         **DATA EXTRACTION RULES:**
         - After writing the user response, you MUST output a JSON object that conforms to the provided schema.
@@ -259,26 +304,34 @@ def process_input(client_sb, user_id, user_input):
         - If the user asks to delete or forget data:
             - For a SPECIFIC item (e.g., "forget my favorite color"), use `action_type: "delete"` and specify the `key_name`.
             - For their PROFILE data (e.g., "delete my personal data"), use `action_type: "delete"` with `memory_target: "profile"`.
-            - For CHAT HISTORY, use `action_type: "delete"` with `memory_target: "chat_memories"`.
-            - For EVERYTHING, use `action_type: "delete"` with `memory_target: "all"`.
+            - For CHAT HISTORY (e.g., "forget our conversation"), use `action_type: "delete"` with `memory_target: "chat_memories"`.
+            - For EVERYTHING (e.g., "forget everything about me"), use `action_type: "delete"` with `memory_target: "all"`.
         - If no preferences or commands are found, the "preferences" list in the JSON must be empty.
-        - Select operations only related to the user prompt, not to the provided context. Use the context only to determine if the new prompt contains a new preference to save or data to forget.
+        - Base your data extraction *only* on the user's latest message. Use the provided context (profile, history, memories) solely to understand if the user's new message introduces a change or a request to forget something.
 
         **CONTEXT FOR YOUR RESPONSE AND ANALYSIS:**
         - USER PROFILE KEYS: {current_profile}
         - RECENT CHAT LOGS: {chat_history}
         - RETRIEVED LONG-TERM MEMORIES (RAG): {relevant_memories}
+
+        **ADDITIONAL INFO:**
+        - You are working on behalf of Personal Copilot Project (PCP).
+        - PCP saves conversation summaries and user preferences to build its memory.
+        - Users can ask you to forget specific facts, their entire profile, or their chat history at any time.
+        - You can handle Text, Audio and Images as input.
+           - Media like audio and images are not stored. They are converted to text (transcriptions or descriptions) for you to access, so you cannot 're-watch' an image or 're-listen' to audio.
         """
 
-        json_response = call_gemini_with_retry(
-            model='gemini-3.5-flash',
-            prompt=user_input,
+        dual_output = await call_gemini_with_retry(
+            model='gemini-3.5-flash', 
+            contents=user_input, 
             system_prompt=unified_prompt,
             schema_output=GeminiDualOutput,
-            mime_type="application/json"
+            mime_type="application/json", 
+            websearch=True, 
+            temperature=0.4 # Use a higher temperature for more natural-sounding conversation
         )
         
-        dual_output = GeminiDualOutput.model_validate_json(json_response)
         final_response = dual_output.assistant_response
 
         if dual_output.preferences:
@@ -294,29 +347,83 @@ def process_input(client_sb, user_id, user_input):
         
         if azioni_eseguite:
             action_list_summary = " " + ", and you ".join(azioni_eseguite) + "."
-            print(f"✅ [DB-PREP] Actions prepared for background execution:{action_list_summary}")
+            logging.info("DB-PREP: Actions prepared for background execution:%s", action_list_summary)
         else:
-            print("⏸️ [BACKGROUND SKIP] No preferences detected.")
+            logging.info("DB-PREP: No database actions detected.")
 
-        print(f"\n💬 User Input: '{user_input}'")
-        print(f"🤖 Assistant Response ({language_setting}):\n{final_response}\n" + "-"*60)
+        logging.info("User Input: '%s'", user_input)
+        logging.info("Assistant Response (%s):\n%s", language_setting, final_response)
 
+        # Return the response and the pending DB tasks to be executed in the background
+        return final_response, delete_chat_memory, keys_to_delete, records_to_upsert, language_setting
+    except Exception as e:
+        logging.critical("CRITICAL ERROR in processing/response generation: %s", e)
+        return "Sorry, an error occurred.", None, None, None, 'en'
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles the /start command.
+
+    Sends a welcome message and creates a default profile for new users.
+    """
+    user = update.message.from_user
+    user_id = user.id
+    supabase_client = context.bot_data['supabase_client']
+
+    # Check if user profile already exists
+    existing_profile = supabase_client.table("telegram_user_profile").select("user_id").eq("user_id", user_id).limit(1).execute()
+
+    if not existing_profile.data:
+        logging.info("New user detected (ID: %d). Creating default profile.", user_id)
+        
+        # Prepare default settings from Telegram user data
+        default_language = user.language_code if user.language_code else 'en'
+        default_records = [
+            {"user_id": user_id, "key_name": "user_name", "value_data": user.full_name, "context_desc": "The user's full name.", "is_sensitive": False},
+            {"user_id": user_id, "key_name": "user_language", "value_data": default_language, "context_desc": "The user's preferred language code (ISO 639-1).", "is_sensitive": False},
+            {"user_id": user_id, "key_name": "user_locale", "value_data": default_language, "context_desc": "The user's locale setting.", "is_sensitive": False},
+            {"user_id": user_id, "key_name": "user_timezone", "value_data": "UTC", "context_desc": "The user's timezone.", "is_sensitive": False},
+        ]
+
+        try:
+            # Run the synchronous DB operation in a thread to avoid blocking
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, 
+                lambda: supabase_client.table("telegram_user_profile").upsert(default_records).execute()
+            )
+            logging.info("Default profile for user %d created successfully.", user_id)
+        except Exception as e:
+            logging.error("Failed to create default profile for user %d: %s", user_id, e)
+
+    await update.message.reply_text(f"Hello {user.first_name}! I am your personal memory assistant. Talk to me and I will remember our conversations.")
+
+async def run_background_processing(
+    supabase_client, user_id, user_input, final_response, 
+    delete_chat_memory, keys_to_delete, records_to_upsert, language_setting
+):
+    """
+    Asynchronously handles all post-response tasks: embedding generation and database writes.
+    This coroutine is designed to be run as a background task.
+    """
+    try:
         # Prepare text for long-term memory embedding
         interaction_text = f"User said: '{user_input}' | Assistant replied: '{final_response}'"
 
-        # Background Task: Translate and summarize only if the conversation is not already in English.
+        # Translate and summarize if the conversation is not already in English.
         if language_setting != 'en':
-            english_interaction = call_gemini_with_retry(
-                model='gemini-3.5-flash', # STRATEGY: Use the main, more stable model to avoid congestion on 'lite' versions.
-                prompt=f"Summarize this interaction into a concise English fact: {interaction_text}",
-                system_prompt="Summarize interaction into clean facts."
-            )
+            # UPDATE: Changed parameter to 'contents' (implicit temperature of 0.1)
+            english_interaction = await call_gemini_with_retry(
+                model='gemini-3.1-flash-lite', 
+                contents=f"Summarize the following interaction into a single, self-contained English sentence that captures the core fact or outcome: {interaction_text}",
+                system_prompt="You are an expert summarizer. Your goal is to create concise, factual summaries of interactions for a memory system."
+            ) 
         else:
             english_interaction = interaction_text
         
-        interaction_vector = generate_embedding_with_retry(english_interaction)
+        interaction_vector = await generate_embedding_with_retry(english_interaction, task_type="RETRIEVAL_DOCUMENT")
 
-        # 2. Execute all database writes in the background
+        # Execute all database writes in the background
         background_tasks = {
             "delete_chat_memories": delete_chat_memory,
             "profile_keys_to_delete": keys_to_delete,
@@ -325,35 +432,115 @@ def process_input(client_sb, user_id, user_input):
                 "user_id": user_id, "memory_text": english_interaction, "memory_vector": interaction_vector
             }
         }
-        _execute_background_tasks(client_sb, user_id, background_tasks)
-        return final_response
+        # Run the synchronous DB operations in a thread.
+        await asyncio.to_thread(_execute_background_tasks, supabase_client, user_id, background_tasks)
     except Exception as e:
-        print(f"❌ CRITICAL ERROR in processing/response generation: {e}")
-        return "Sorry, error occurred."
+        logging.error("Error in background processing for user %d: %s", user_id, e)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the /start command is issued."""
-    await update.message.reply_text("Hello! I am your personal memory assistant. Talk to me and I will remember our conversations.")
+async def process_and_reply(user_input: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Core logic to process a text input, send a reply, and run background tasks.
+    """
+    user_id = update.message.from_user.id
+    supabase_client = context.bot_data['supabase_client']
+
+    # Let the user know the bot is thinking
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    # 1. Get the user-facing response as quickly as possible
+    final_response, delete_chat, keys_delete, records_upsert, lang_setting = await process_input(
+        supabase_client, user_id, user_input
+    )
+
+    # 2. Send the response to the user immediately
+    await update.message.reply_text(final_response)
+
+    # 3. Start all post-processing tasks in a background thread
+    if final_response != "Sorry, an error occurred.":
+        asyncio.create_task(run_background_processing(
+                supabase_client, user_id, user_input, final_response,
+                delete_chat, keys_delete, records_upsert, lang_setting
+            )
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles incoming text messages and processes them with the agent logic."""
-    user_input = update.message.text
-    user_id = update.message.from_user.id  # Use Telegram user ID as the unique identifier
+    await process_and_reply(update.message.text, update, context)
 
-    # Run the synchronous processing function in a separate thread to avoid blocking the bot
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None, process_input, context.bot_data['supabase_client'], user_id, user_input
-    )
-    
-    await update.message.reply_text(response)
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles voice messages by transcribing them and then processing the text."""
+    await update.message.reply_text("Trascrivo il tuo messaggio vocale e preparo una risposta...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    voice_file = await update.message.voice.get_file()
+    voice_bytes = await voice_file.download_as_bytearray()
+    voice_mime_type = update.message.voice.mime_type
+
+    try:
+        # SDK UPDATE: Correct generation of multimedia content
+        audio_part = types.Part.from_bytes(data=bytes(voice_bytes), mime_type=voice_mime_type)
+
+        # UPDATE: Now using call_gemini_with_retry protected by Tenacity
+        transcribed_text = await call_gemini_with_retry(
+            model='gemini-3.1-flash-lite', 
+            contents=["Transcribe this audio message to English.", audio_part], # Multimodal list with text prompt and audio
+            system_prompt="You are a transcription assistant. Transcribe the provided audio into English text."
+            # Default temperature of 0.1 is used to avoid hallucinations in the transcription
+        )
+
+        logging.info("Transcription result: %s", transcribed_text)
+        
+        # Pass the transcribed text to the main bot logic
+        await process_and_reply(transcribed_text, update, context)
+
+    except Exception as e:
+        logging.error("Error processing voice message: %s", e)
+        await update.message.reply_text("Spiacente, non sono riuscito a elaborare il messaggio vocale.")
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles photo messages by analyzing them and sending a direct response."""
+    await update.message.reply_text("Sto analizzando l'immagine...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+
+    try:
+        # SDK UPDATE: Correct generation of the image part
+        image_part = types.Part.from_bytes(data=bytes(photo_bytes), mime_type="image/jpeg")
+
+        user_id = update.message.from_user.id
+        supabase_client = context.bot_data['supabase_client']
+        current_profile = await asyncio.to_thread(_get_user_profile, supabase_client, user_id) 
+        language_setting = next((row['value_data'] for row in current_profile if row['key_name'] == 'user_language'), 'en')
+
+        # Build the content list (User caption + Image object)
+        user_caption = update.message.caption or "Describe this image in detail."
+        prompt_contents = [user_caption, image_part]
+
+        # UPDATE: Now using call_gemini_with_retry with temperature at 0.4
+        response_text = await call_gemini_with_retry(
+            model='gemini-3.5-flash', # A top model, great with multimodal vision
+            contents=prompt_contents, 
+            system_prompt=f"You are a helpful assistant analyzing an image. Your response MUST be in the language with this ISO 639-1 code: {language_setting}.",
+            temperature=0.4 # A higher temperature allows for more fluid and expressive text
+        )
+
+        await update.message.reply_text(response_text)
+
+    except Exception as e:
+        logging.error("Error processing photo message: %s", e)
+        await update.message.reply_text("Spiacente, non sono riuscito ad analizzare l'immagine.")
+
 
 if __name__ == "__main__":
-    """Starts the Telegram bot."""
-    print("--- STARTING TELEGRAM BOT ---")
+    """Initializes and runs the Telegram bot."""
+    logging.info("--- STARTING TELEGRAM BOT ---")
 
-    # Create a single, global Supabase client using the public API key
-    supabase_client = create_client(COMPLETE_SUPABASE_URL, SUPABASE_KEY)
+    # Create a single, global Supabase client using the powerful service_role key.
+    # This client bypasses RLS, so security is handled within the Python code.
+    supabase_client = create_client(COMPLETE_SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.bot_data['supabase_client'] = supabase_client
@@ -361,6 +548,8 @@ if __name__ == "__main__":
     # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
     # Run the bot
     application.run_polling()
