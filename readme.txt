@@ -1,61 +1,98 @@
 # Personal Copilot Project (Gemini GenAI & Supabase RAG)
 
-This project is a high-performance, asynchronous Telegram bot that acts as a personal AI assistant with long-term memory capabilities. It features an advanced cognitive architecture powered by the latest Google Gemini GenAI SDK and uses Supabase for structured data persistence and multimodal vector search (RAG).
+Asynchronous Telegram bot that acts as a personal AI assistant with long-term memory. Powered by the Google GenAI SDK and Supabase (PostgreSQL + pgvector).
 
-## 🌟 Key Features
+## Key Features
 
-*   **Next-Gen AI Core**: Migrated entirely to the official, unified **Google GenAI SDK** using advanced models (`gemini-3.5-flash`, `gemini-3.1-flash-lite`, and `gemini-embedding-2`).
-*   **Multimodal Capabilities**: Native support for **Voice Message Transcription** and **Photo/Image Analysis** directly through the bot interface.
-*   **Real-Time Web Search (Grounding)**: Dynamic integration with Google Search. The bot can independently browse the internet to provide up-to-date answers when required.
-*   **Dual Structured Output**: Utilizes Pydantic schemas and Gemini's native JSON output to generate human-facing text and extract database operations (profile changes/GDPR deletions) simultaneously in a single, atomic API call.
-*   **Long-Term Vector Memory (RAG)**: Generates 3072-dimensional embeddings via `gemini-embedding-2` to store summaries of past interactions and retrieve them semantically via PostgreSQL's `pgvector`.
-*   **Asynchronous & Resilient Architecture**: Non-blocking network I/O with `asyncio`, isolated database write operations inside parallel background threads (`ThreadPoolExecutor`), and exponential backoff retry-logic via `tenacity` protecting against 503 Overload errors.
+* **Multimodal input**: text, voice transcription, and photo analysis through the same agent pipeline.
+* **Dual structured output**: one Gemini call returns the user-facing reply and profile operations (upsert/delete) as JSON.
+* **Two-layer memory**:
+  * *Short-term*: last 5 conversation summaries injected into every prompt.
+  * *Long-term (RAG)*: vector search on older memories, only when the message likely references the past.
+* **On-demand web search**: a separate Gemini call with Google Search runs only when keywords suggest fresh/live data (news, weather, today, etc.). It cannot be combined with structured JSON in the same request, so search results are injected into the main prompt as context.
+* **Original-language storage**: memories and profile values are stored in the user's language; embeddings are multilingual (`gemini-embedding-2`).
+* **Security & access**: Supabase RLS blocks direct table access; the bot uses the **anon key** and SECURITY DEFINER RPC functions. Optional allowlist and per-user rate limiting.
+* **Resilient async pipeline**: reply first, then background embedding and DB writes; timeouts, retries, and graceful shutdown.
 
-## 🛠️ Tech Stack
+## Tech Stack
 
-*   **Language**: Python 3.10+
-*   **AI Engine**: Google GenAI SDK (Unified Client API)
-*   **Database**: Supabase (PostgreSQL + `pgvector` extension)
-*   **Key Python Libraries**:
-    *   `google-genai` (Official & Unified Google SDK)
-    *   `python-telegram-bot` (v20+ Native Async)
-    *   `supabase` (Python Client)
-    *   `pydantic` (v2+ Data Validation)
-    *   `tenacity` (Advanced Retrying)
-    *   `python-dotenv`
+* **Language**: Python 3.10+
+* **AI**: Google GenAI SDK (`gemini-3.5-flash`, `gemini-3.1-flash-lite`, `gemini-embedding-2`)
+* **Database**: Supabase (PostgreSQL + pgvector)
+* **Libraries**: `google-genai`, `python-telegram-bot`, `supabase`, `pydantic`, `tenacity`, `python-dotenv`
 
-## 🚀 Getting Started
+## Getting Started
 
-### 1. Clone the Repository
+### 1. Clone and install
+
 ```bash
 git clone https://github.com/Fharamir/PCP.git
-cd PCP
-```
-
-### 2. Install Dependencies
-Install the required up-to-date Python packages:
-```bash
+cd PCP/Telegram
 pip install google-genai python-telegram-bot supabase pydantic tenacity python-dotenv
 ```
 
-### 3. Configure Environment Variables
-Create a file named `accessdata.env` in the Telegram directory and fill it with your credentials:
+### 2. Environment variables
+
+Create `Telegram/accessdata.env`:
+
 ```dotenv
 SUPABASE_URL="<your-supabase-project-id>"
 SUPABASE_KEY="<your-supabase-anon-key>"
-SUPABASE_SERVICE_KEY="<your-supabase-service-role-key>"
 GEMINI_API_KEY="<your-gemini-api-key>"
 TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
+
+# Optional
+# ALLOWED_USER_IDS="123456789,987654321"
+# MAX_MEMORIES_PER_USER=100
+# RATE_LIMIT_SECONDS=3
+# GEMINI_TIMEOUT_SECONDS=120
+# BOT_DEBUG=true
 ```
 
-### 4. Database Setup (Supabase)
-Go to the **SQL Editor** in your Supabase dashboard and run the following script. This configures the schema for structured preferences and maps the 3072-dimensional space required for `gemini-embedding-2`.
+The bot no longer requires the service role key at runtime.
+
+### 3. Database setup (Supabase SQL Editor)
+
+Run in order:
+
+1. **Base schema** (tables + `match_telegram_memories` RPC) — see section below if starting from scratch.
+2. **`Telegram/supabase_rls.sql`** — enables RLS, creates `bot_*` RPC functions, grants execute to `anon`.
+
+### 4. Run the bot
+
+```bash
+cd Telegram
+python Bot_Telegram.py
+```
+
+## Message Pipeline
+
+```
+User message
+  → allowlist + rate limit
+  → per-user lock
+  → fetch profile + last 5 memories (short-term)
+  → [optional] RAG vector search (keyword/heuristic gated)
+  → [optional] web search snapshot (keyword gated, separate Gemini call)
+  → Gemini structured call (reply + profile ops)
+  → send reply to user
+  → background: embed interaction → insert memory → prune to MAX_MEMORIES_PER_USER
+```
+
+## Model Routing
+
+| Task | Model | Notes |
+|------|-------|-------|
+| Main reply + profile extraction | `gemini-3.5-flash` (temp 0.4) | Structured JSON output |
+| Web search snapshot | `gemini-3.1-flash-lite` (temp 0.1) | Separate call with Google Search |
+| Voice transcription | `gemini-3.1-flash-lite` | Original spoken language |
+| Embeddings | `gemini-embedding-2` | 3072-dim, original language text |
+
+## Base Schema (first-time setup)
 
 ```sql
--- 1. Enable the vector extension if not already enabled
 create extension if not exists vector;
 
--- 2. Create the table for Telegram user profile data
 create table telegram_user_profile (
   user_id bigint not null,
   key_name text not null,
@@ -66,7 +103,6 @@ create table telegram_user_profile (
   primary key (user_id, key_name)
 );
 
--- 3. Create the table for Telegram long-term vector memory
 create table telegram_agent_memories (
   id bigserial primary key,
   user_id bigint not null,
@@ -75,7 +111,6 @@ create table telegram_agent_memories (
   created_at timestamptz default now()
 );
 
--- 4. Create the RPC function for semantic search (Cosine Distance)
 create or replace function match_telegram_memories (
   query_embedding vector(3072),
   match_threshold float,
@@ -88,18 +123,19 @@ returns table (
   similarity float
 )
 language sql stable
-as \[   select     tam.id,     tam.memory_text,     1 - (tam.memory_vector <=> query_embedding) as similarity   from telegram_agent_memories tam   where tam.user_id = p_user_id and 1 - (tam.memory_vector <=> query_embedding) > match_threshold   order by similarity desc   limit match_count; \];
+security definer
+set search_path = public
+as $$
+  select
+    tam.id,
+    tam.memory_text,
+    1 - (tam.memory_vector <=> query_embedding) as similarity
+  from telegram_agent_memories tam
+  where tam.user_id = p_user_id
+    and 1 - (tam.memory_vector <=> query_embedding) > match_threshold
+  order by similarity desc
+  limit match_count;
+$$;
 ```
 
-## 💻 Usage
-
-Run the asynchronous bot interface:
-```bash
-python Bot_Telegram.py
-```
-
-### Cognitive Model Routing Protocol (Internal Logic)
-The bot optimizes token usage and costs by routing different tasks to specific Gemini architectures:
-1.  **`gemini-3.1-flash-lite`** (Temp 0.1): Handles translation queries, conversation summaries, database operations, and text transcriptions.
-2.  **`gemini-3.5-flash`** (Temp 0.4): Handles core interactions, multimodal context analysis (vision), agentic reasoning, and grounding with Google Search.
-3.  **`gemini-embedding-2`**: Native multimodal 3072-dimension mapping for semantic long-term memory storage.
+Then run `Telegram/supabase_rls.sql`.

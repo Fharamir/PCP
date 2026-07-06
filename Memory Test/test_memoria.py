@@ -149,7 +149,7 @@ def search_past_memories(client_sb, user_id, search_text):
 def _get_chat_history(client_sb, user_id):
     """Fetches the recent chat history from Supabase."""
     try:
-        response = client_sb.table("agent_memories").select("memory_text").eq("user_id", user_id).order("created_at", ascending=False).limit(MAX_STORAGE).execute()
+        response = client_sb.table("agent_memories").select("memory_text").eq("user_id", user_id).order("created_at", desc=True).limit(MAX_STORAGE).execute()
         history = [row['memory_text'] for row in response.data]
         history.reverse()
         return history
