@@ -25,6 +25,33 @@ create policy "deny_anon_memories"
 -- 2. SECURITY DEFINER RPC functions (bot uses anon key + these functions)
 -- ---------------------------------------------------------------------------
 
+-- RAG search must bypass RLS (anon has no direct table access).
+create or replace function match_telegram_memories (
+  query_embedding vector(3072),
+  match_threshold float,
+  match_count int,
+  p_user_id bigint
+)
+returns table (
+  id bigint,
+  memory_text text,
+  similarity float
+)
+language sql stable
+security definer
+set search_path = public
+as $$
+  select
+    tam.id,
+    tam.memory_text,
+    1 - (tam.memory_vector <=> query_embedding) as similarity
+  from telegram_agent_memories tam
+  where tam.user_id = p_user_id
+    and 1 - (tam.memory_vector <=> query_embedding) > match_threshold
+  order by similarity desc
+  limit match_count;
+$$;
+
 create or replace function bot_user_profile_exists(p_user_id bigint)
 returns boolean
 language sql
@@ -147,6 +174,7 @@ $$;
 -- ---------------------------------------------------------------------------
 -- 3. Grants for anon role (used by the bot with SUPABASE_KEY)
 -- ---------------------------------------------------------------------------
+revoke all on function match_telegram_memories(vector, double precision, integer, bigint) from public;
 revoke all on function bot_user_profile_exists(bigint) from public;
 revoke all on function bot_get_profile(bigint) from public;
 revoke all on function bot_upsert_profile_records(jsonb) from public;

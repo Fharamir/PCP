@@ -123,6 +123,8 @@ returns table (
   similarity float
 )
 language sql stable
+security definer
+set search_path = public
 as $$
   select
     tam.id,

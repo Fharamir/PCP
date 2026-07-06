@@ -39,9 +39,13 @@ GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "120"))
 RATE_LIMIT_SECONDS = float(os.getenv("RATE_LIMIT_SECONDS", "3"))
 BOT_DEBUG = os.getenv("BOT_DEBUG", "").lower() in ("1", "true", "yes")
 # Empty ALLOWED_USER_IDS = bot open to everyone; set comma-separated Telegram IDs to restrict access.
-ALLOWED_USER_IDS = frozenset(
-    uid.strip() for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
-)
+
+def _parse_allowed_user_ids(raw: str | None = None) -> frozenset:
+    if raw is None:
+        raw = os.getenv("ALLOWED_USER_IDS", "")
+    return frozenset(uid.strip() for uid in raw.split(",") if uid.strip())
+
+ALLOWED_USER_IDS = _parse_allowed_user_ids()
 REQUIRED_ENV_VARS = ("SUPABASE_URL", "SUPABASE_KEY", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN")
 _pending_background_tasks: set[asyncio.Task] = set()
 _user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -110,6 +114,13 @@ def _needs_web_search(text: str) -> bool:
     """Keyword gate for a separate Gemini call with Google Search enabled."""
     normalized = text.lower().strip()
     return any(signal in normalized for signal in _WEB_SEARCH_SIGNALS)
+
+def _reload_allowed_user_ids() -> frozenset:
+    """Re-read ALLOWED_USER_IDS from accessdata.env (called on /start)."""
+    global ALLOWED_USER_IDS
+    load_dotenv(dotenv_path=_ENV_PATH, override=True)
+    ALLOWED_USER_IDS = _parse_allowed_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
+    return ALLOWED_USER_IDS
 
 def _is_user_allowed(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
@@ -483,8 +494,18 @@ async def process_input(client_sb, user_id, user_input: Union[str, List[Any]], r
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /start command and creates a default profile for new users."""
+    _reload_allowed_user_ids()
     user = update.message.from_user
     user_id = user.id
+    if ALLOWED_USER_IDS and not _is_user_allowed(user_id):
+        logging.info(
+            "Unauthorized /start (add to ALLOWED_USER_IDS): telegram_id=%d username=%s name=%r",
+            user_id,
+            f"@{user.username}" if user.username else "none",
+            user.full_name,
+        )
+    if not await _ensure_user_access(update):
+        return
     supabase_client = context.bot_data["supabase_client"]
     exists = await asyncio.to_thread(
         lambda: supabase_client.rpc("bot_user_profile_exists", {"p_user_id": user_id}).execute()
